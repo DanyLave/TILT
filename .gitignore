@@ -1,3 +1,6 @@
+# Dependencies
+node_modules/
+
 # Python server artefacts
 __pycache__/
 *.py[cod]
