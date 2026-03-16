@@ -1,0 +1,10 @@
+# Python server artefacts
+__pycache__/
+*.py[cod]
+
+# VS Code
+.vscode/
+
+# OS
+Thumbs.db
+.DS_Store
