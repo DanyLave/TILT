@@ -388,156 +388,288 @@
     </div>
 </div>
 
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
+<script src="firebase-config.js"></script>
 <script src="Tilt.V1.js"></script>
 <script src="categories.js"></script>
 <script>
-// ================================================================
-//  IDENTITY
-// ================================================================
-const myId = (Date.now().toString(36) + Math.random().toString(36).slice(2)).toUpperCase();
-let myName = '';
+const DEFAULT_CATEGORY_KEY = Object.keys(CATEGORY_SETS)[0] || 'default';
+const PLAYER_ID_KEY = 'tiltPlayerId';
 
-// ================================================================
-//  SCREEN ROUTER
-// ================================================================
+const myId = (() => {
+    const existing = localStorage.getItem(PLAYER_ID_KEY);
+    if (existing) return existing;
+    const generated = (Date.now().toString(36) + Math.random().toString(36).slice(2)).toUpperCase();
+    localStorage.setItem(PLAYER_ID_KEY, generated);
+    return generated;
+})();
+
+let myName = '';
+let isHost = false;
+let currentLobbyCode = '';
+let myGs = null;
+
+let lobby = {
+    code: '',
+    players: [],
+    cardsPerPlayer: 5,
+    categorySetKeys: [DEFAULT_CATEGORY_KEY],
+    status: 'waiting'
+};
+
+let app = null;
+let db = null;
+
+let lobbyRef = null;
+let actionsRef = null;
+let connectedRef = null;
+let currentPlayerRef = null;
+
+const EMOJI = { apple:'🍎', umbrella:'☂️', airplane:'✈️', flower:'🌸', star:'⭐' };
+
 function showScreen(name) {
     document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
     document.getElementById('screen-' + name).classList.add('active');
 }
 
-// ================================================================
-//  XSS-SAFE HELPERS
-// ================================================================
 function esc(str) {
     return String(str)
-        .replace(/&/g,'&amp;').replace(/</g,'&lt;')
-        .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
 }
-
-// ================================================================
-//  NETWORKING  (BroadcastChannel)
-// ================================================================
-const MSG = {
-    PING:'PING', JOIN_REQUEST:'JOIN_REQUEST', LOBBY_STATE:'LOBBY_STATE',
-    GAME_START:'GAME_START', GAME_STATE:'GAME_STATE',
-    ACTION_DRAW:'ACTION_DRAW', ACTION_CAPTURE:'ACTION_CAPTURE',
-};
-
-let myChannel = null;
-let isHost    = false;
-
-function openChannel(code) {
-    if (myChannel) myChannel.close();
-    myChannel = new BroadcastChannel('tilt-' + code.toUpperCase());
-    myChannel.onmessage = ({ data }) => onMessage(data);
-}
-function send(type, payload) {
-    if (myChannel) myChannel.postMessage({ type, payload, from: myId });
-}
-function onMessage({ type, payload, from }) {
-    switch (type) {
-        case MSG.PING:           if (isHost)  hostBroadcastLobby();           break;
-        case MSG.JOIN_REQUEST:   if (isHost)  hostHandleJoin(payload, from);  break;
-        case MSG.LOBBY_STATE:    if (!isHost) receiveLobbyState(payload);     break;
-        case MSG.GAME_START:     if (!isHost) receiveGameStart(payload);      break;
-        case MSG.GAME_STATE:     if (!isHost) receiveGameState(payload);      break;
-        case MSG.ACTION_DRAW:    if (isHost)  hostProcessDraw(from);          break;
-        case MSG.ACTION_CAPTURE: if (isHost)  hostProcessCapture(from, payload.fromId); break;
-    }
-}
-
-// ================================================================
-//  LOBBY STATE
-// ================================================================
-let lobby = { code:'', players:[], cardsPerPlayer:5, categorySetKeys:['geography'], status:'waiting' };
 
 function generateCode() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    return Array.from({length:6}, () => chars[Math.floor(Math.random()*chars.length)]).join('');
+    return Array.from({ length: 6 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
 }
 
-// ──── CREATE ────
-function createLobby() {
+function firebaseReady() {
+    if (db) return true;
+    document.getElementById('create-error').textContent = 'Configura Firebase in firebase-config.js';
+    document.getElementById('join-error').textContent = 'Configura Firebase in firebase-config.js';
+    return false;
+}
+
+function initFirebase() {
+    const cfg = window.FIREBASE_CONFIG;
+    if (!cfg || !cfg.apiKey || String(cfg.apiKey).includes('INSERISCI')) return;
+    app = firebase.initializeApp(cfg);
+    db = firebase.database(app);
+}
+
+function sortPlayers(playersObj, hostId) {
+    return Object.values(playersObj || {})
+        .sort((a, b) => {
+            if (a.id === hostId) return -1;
+            if (b.id === hostId) return 1;
+            return (a.joinedAt || 0) - (b.joinedAt || 0);
+        });
+}
+
+function setupPresence() {
+    if (!db || !currentLobbyCode) return;
+    if (connectedRef) connectedRef.off();
+
+    connectedRef = db.ref('.info/connected');
+    connectedRef.on('value', (snap) => {
+        if (!snap.val() || !currentLobbyCode) return;
+        currentPlayerRef = db.ref(`lobbies/${currentLobbyCode}/players/${myId}`);
+        currentPlayerRef.onDisconnect().remove();
+    });
+}
+
+function attachLobbyListener(code) {
+    detachRealtimeListeners();
+    currentLobbyCode = code;
+    lobbyRef = db.ref(`lobbies/${code}`);
+    lobbyRef.on('value', (snap) => {
+        if (!snap.exists()) {
+            myGs = null;
+            if (document.getElementById('screen-game').classList.contains('active') || document.getElementById('screen-lobby').classList.contains('active')) {
+                alert('La lobby non esiste più.');
+                showScreen('landing');
+            }
+            return;
+        }
+
+        const data = snap.val();
+        const players = sortPlayers(data.players || {}, data.hostId);
+
+        lobby = {
+            code,
+            players,
+            cardsPerPlayer: data.cardsPerPlayer || 5,
+            categorySetKeys: data.categorySetKeys || [DEFAULT_CATEGORY_KEY],
+            status: data.status || 'waiting'
+        };
+
+        isHost = data.hostId === myId;
+
+        if (isHost && !actionsRef) {
+            actionsRef = db.ref(`lobbies/${currentLobbyCode}/actionRequests`);
+            actionsRef.on('child_added', async (actionSnap) => {
+                const action = actionSnap.val();
+                if (!action) return;
+                if (action.type === 'draw') await hostProcessDraw(action.playerId);
+                if (action.type === 'capture') await hostProcessCapture(action.playerId, action.fromId);
+                await actionSnap.ref.remove();
+            });
+        }
+
+        if (!isHost && actionsRef) {
+            actionsRef.off();
+            actionsRef = null;
+        }
+
+        if (data.status === 'playing' && data.gameState) {
+            myGs = data.gameState;
+            enterGame();
+            return;
+        }
+
+        myGs = null;
+        enterLobbyScreen();
+    });
+
+    setupPresence();
+}
+
+function detachRealtimeListeners() {
+    if (lobbyRef) {
+        lobbyRef.off();
+        lobbyRef = null;
+    }
+    if (actionsRef) {
+        actionsRef.off();
+        actionsRef = null;
+    }
+    if (connectedRef) {
+        connectedRef.off();
+        connectedRef = null;
+    }
+}
+
+async function createLobby() {
+    if (!firebaseReady()) return;
+
     const name = document.getElementById('create-name').value.trim();
-    if (!name) { document.getElementById('create-error').textContent = 'Inserisci il tuo nome.'; return; }
+    if (!name) {
+        document.getElementById('create-error').textContent = 'Inserisci il tuo nome.';
+        return;
+    }
 
     const selectedKeys = Array.from(document.querySelectorAll('.cat-token.selected')).map(t => t.dataset.key);
-    if (selectedKeys.length === 0) { document.getElementById('create-error').textContent = 'Scegli almeno una categoria.'; return; }
+    if (selectedKeys.length === 0) {
+        document.getElementById('create-error').textContent = 'Scegli almeno una categoria.';
+        return;
+    }
     document.getElementById('create-error').textContent = '';
 
-    myName = name; isHost = true;
-    const code = generateCode();
-    lobby = {
-        code,
-        players: [{ id:myId, name:myName, isHost:true }],
-        cardsPerPlayer: parseInt(document.getElementById('create-cards').value),
-        categorySetKeys: selectedKeys,
-        status: 'waiting'
-    };
-    openChannel(code);
-    enterLobbyScreen();
+    myName = name;
+    isHost = true;
+
+    for (let i = 0; i < 8; i++) {
+        const code = generateCode();
+        const ref = db.ref(`lobbies/${code}`);
+        const exists = await ref.once('value');
+        if (exists.exists()) continue;
+
+        const now = Date.now();
+        await ref.set({
+            code,
+            hostId: myId,
+            status: 'waiting',
+            cardsPerPlayer: parseInt(document.getElementById('create-cards').value, 10),
+            categorySetKeys: selectedKeys,
+            createdAt: now,
+            players: {
+                [myId]: {
+                    id: myId,
+                    name: myName,
+                    isHost: true,
+                    joinedAt: now
+                }
+            }
+        });
+
+        attachLobbyListener(code);
+        return;
+    }
+
+    document.getElementById('create-error').textContent = 'Impossibile creare lobby, riprova.';
 }
 
-// ──── JOIN ────
-let joinTimeout = null;
+async function joinLobby() {
+    if (!firebaseReady()) return;
 
-function joinLobby() {
     const name = document.getElementById('join-name').value.trim();
     const code = document.getElementById('join-code').value.trim().toUpperCase();
-    const err  = document.getElementById('join-error');
-    if (!name) { err.textContent = 'Inserisci il tuo nome.'; return; }
-    if (code.length !== 6) { err.textContent = 'Il codice deve avere 6 caratteri.'; return; }
+    const err = document.getElementById('join-error');
+
+    if (!name) {
+        err.textContent = 'Inserisci il tuo nome.';
+        return;
+    }
+    if (code.length !== 6) {
+        err.textContent = 'Il codice deve avere 6 caratteri.';
+        return;
+    }
+
+    const ref = db.ref(`lobbies/${code}`);
+    const snap = await ref.once('value');
+    if (!snap.exists()) {
+        err.textContent = 'Lobby non trovata — controlla il codice.';
+        return;
+    }
+
+    const data = snap.val();
+    if (data.status !== 'waiting') {
+        err.textContent = 'Partita già iniziata o lobby chiusa.';
+        return;
+    }
+
     err.textContent = '';
+    myName = name;
+    isHost = false;
 
-    myName = name; isHost = false; lobby.code = code;
-    openChannel(code);
-    send(MSG.PING);
-    send(MSG.JOIN_REQUEST, { id:myId, name:myName });
+    await db.ref(`lobbies/${code}/players/${myId}`).set({
+        id: myId,
+        name: myName,
+        isHost: false,
+        joinedAt: Date.now()
+    });
 
-    joinTimeout = setTimeout(() => {
-        if (!document.getElementById('screen-lobby').classList.contains('active')) {
-            document.getElementById('join-error').textContent = 'Lobby non trovata — controlla il codice.';
-            myChannel.close();
-        }
-    }, 5000);
-}
-
-function hostHandleJoin(payload) {
-    if (lobby.players.find(p => p.id === payload.id)) { hostBroadcastLobby(); return; }
-    lobby.players.push({ id:payload.id, name:payload.name, isHost:false });
-    hostBroadcastLobby(); renderLobby();
-}
-function hostBroadcastLobby() { send(MSG.LOBBY_STATE, lobby); }
-
-function receiveLobbyState(state) {
-    lobby = state;
-    if (joinTimeout) { clearTimeout(joinTimeout); joinTimeout = null; }
-    if (!document.getElementById('screen-lobby').classList.contains('active')) enterLobbyScreen();
-    renderLobby();
+    attachLobbyListener(code);
 }
 
 function enterLobbyScreen() {
-    document.getElementById('lobby-code-display').textContent = lobby.code;
-    showScreen('lobby'); renderLobby();
+    document.getElementById('lobby-code-display').textContent = currentLobbyCode || lobby.code || '------';
+    showScreen('lobby');
+    renderLobby();
 }
 
 function renderLobby() {
     const list = document.getElementById('lobby-player-list');
     list.innerHTML = '';
-    lobby.players.forEach(p => {
+
+    lobby.players.forEach((p) => {
         const div = document.createElement('div');
         div.className = 'player-row';
         const tags = [
-            p.isHost      ? '<span class="badge badge-host">HOST</span>' : '',
-            p.id === myId ? '<span class="badge badge-you">TU</span>'    : '',
+            p.isHost ? '<span class="badge badge-host">HOST</span>' : '',
+            p.id === myId ? '<span class="badge badge-you">TU</span>' : ''
         ].filter(Boolean).join('');
         div.innerHTML = `<div class="player-row-name">${esc(p.name)}</div><div class="badge-tags">${tags}</div>`;
         list.appendChild(div);
     });
 
-    // Settings summary
     const catLabels = (lobby.categorySetKeys || [])
-        .map(k => CATEGORY_SETS[k] ? CATEGORY_SETS[k].label : k).join(' + ');
+        .map((k) => CATEGORY_SETS[k] ? CATEGORY_SETS[k].label : k)
+        .join(' + ');
+
     document.getElementById('lobby-settings-display').textContent =
         `${lobby.cardsPerPlayer} carte/giocatore · ${catLabels} · ${lobby.players.length} giocator${lobby.players.length !== 1 ? 'i' : 'e'}`;
 
@@ -545,86 +677,134 @@ function renderLobby() {
     const statusEl = document.getElementById('lobby-status');
     if (isHost) {
         startBtn.style.display = lobby.players.length >= 2 ? 'block' : 'none';
-        statusEl.textContent   = lobby.players.length < 2
+        statusEl.textContent = lobby.players.length < 2
             ? 'In attesa di almeno un altro giocatore…'
-            : lobby.players.length + ' giocatori pronti — puoi iniziare!';
+            : `${lobby.players.length} giocatori pronti — puoi iniziare!`;
     } else {
         startBtn.style.display = 'none';
-        statusEl.textContent   = "In attesa che l'host avvii la partita…";
+        statusEl.textContent = "In attesa che l'host avvii la partita…";
     }
 }
 
-function leaveLobby() {
-    if (myChannel) { myChannel.close(); myChannel = null; }
-    isHost = false;
-    lobby  = { code:'', players:[], cardsPerPlayer:5, categorySetKeys:['geography'], status:'waiting' };
+async function leaveLobby() {
+    if (!firebaseReady()) {
+        showScreen('landing');
+        return;
+    }
+
+    const code = currentLobbyCode;
+    if (!code) {
+        showScreen('landing');
+        return;
+    }
+
+    if (isHost) {
+        await db.ref(`lobbies/${code}`).remove();
+    } else {
+        await db.ref(`lobbies/${code}/players/${myId}`).remove();
+    }
+
+    detachRealtimeListeners();
+    currentLobbyCode = '';
+    myGs = null;
+    lobby = {
+        code: '',
+        players: [],
+        cardsPerPlayer: 5,
+        categorySetKeys: [DEFAULT_CATEGORY_KEY],
+        status: 'waiting'
+    };
     showScreen('landing');
 }
 
-// ================================================================
-//  GAME STATE
-// ================================================================
-const EMOJI = { apple:'🍎', umbrella:'☂️', airplane:'✈️', flower:'🌸', star:'⭐' };
-let gs   = null;
-let myGs = null;
+async function startGame() {
+    if (!firebaseReady() || !isHost || !currentLobbyCode) return;
 
-function startGame() {
-    if (!isHost) return;
-    // Merge categories from all selected sets
-    const allCats = (lobby.categorySetKeys || []).flatMap(k => CATEGORY_SETS[k] ? CATEGORY_SETS[k].categories : []);
-    const cats = allCats.length > 0 ? allCats : Object.values(CATEGORY_SETS)[0].categories;
+    const allCats = (lobby.categorySetKeys || []).flatMap((k) => CATEGORY_SETS[k] ? CATEGORY_SETS[k].categories : []);
+    const cats = allCats.length ? allCats : (Object.values(CATEGORY_SETS)[0]?.categories || []);
     const deck = generateDeck(lobby.players.length, lobby.cardsPerPlayer, cats);
-    gs = {
+
+    const gameState = {
         deck,
-        players: lobby.players.map(p => ({ id:p.id, name:p.name, isHost:p.isHost, stack:[], points:0 })),
-        cpIdx: 0, turn: 1, status: 'playing'
+        players: lobby.players.map((p) => ({
+            id: p.id,
+            name: p.name,
+            isHost: !!p.isHost,
+            stack: [],
+            points: 0
+        })),
+        cpIdx: 0,
+        turn: 1,
+        status: 'playing'
     };
-    const snap = snapshot();
-    send(MSG.GAME_START, snap);
-    myGs = snap; enterGame();
+
+    await db.ref(`lobbies/${currentLobbyCode}`).update({
+        status: 'playing',
+        gameState,
+        actionRequests: null
+    });
 }
 
-function snapshot() { return JSON.parse(JSON.stringify(gs)); }
-function receiveGameStart(state) { myGs = state; enterGame(); }
-function receiveGameState(state) { myGs = state; renderGame(); }
-function hostBroadcastGame()     { send(MSG.GAME_STATE, snapshot()); }
+function queueAction(type, fromId) {
+    if (!firebaseReady() || !currentLobbyCode) return;
+    db.ref(`lobbies/${currentLobbyCode}/actionRequests`).push({
+        type,
+        playerId: myId,
+        fromId: fromId || null,
+        createdAt: Date.now()
+    });
+}
 
-// ================================================================
-//  GAME ACTIONS
-// ================================================================
 function onClickDeck() {
-    if (isHost) hostProcessDraw(myId);
-    else        send(MSG.ACTION_DRAW, {});
+    const state = myGs;
+    if (!state) return;
+    const cp = state.players[state.cpIdx];
+    if (!cp || cp.id !== myId || state.deck.length === 0) return;
+    queueAction('draw');
 }
+
 function onClickCapture(fromPlayerId) {
-    if (isHost) hostProcessCapture(myId, fromPlayerId);
-    else        send(MSG.ACTION_CAPTURE, { fromId: fromPlayerId });
+    queueAction('capture', fromPlayerId);
 }
 
-function hostProcessDraw(actorId) {
-    const cp = gs.players[gs.cpIdx];
-    if (cp.id !== actorId) return;
-    if (gs.deck.length === 0) return;
-    cp.stack.push(gs.deck.pop());
-    gs.cpIdx = (gs.cpIdx + 1) % gs.players.length;
-    gs.turn++;
-    hostBroadcastGame(); myGs = snapshot(); renderGame();
+async function hostProcessDraw(actorId) {
+    if (!currentLobbyCode) return;
+    await db.ref(`lobbies/${currentLobbyCode}/gameState`).transaction((state) => {
+        if (!state || !Array.isArray(state.players) || !Array.isArray(state.deck)) return state;
+        const cp = state.players[state.cpIdx];
+        if (!cp || cp.id !== actorId || state.deck.length === 0) return state;
+        const card = state.deck.pop();
+        cp.stack = cp.stack || [];
+        cp.stack.push(card);
+        state.cpIdx = (state.cpIdx + 1) % state.players.length;
+        state.turn = (state.turn || 1) + 1;
+        return state;
+    });
 }
 
-function hostProcessCapture(captorId, fromId) {
-    if (captorId === fromId) return;
-    const captor = gs.players.find(p => p.id === captorId);
-    const from   = gs.players.find(p => p.id === fromId);
-    if (!captor || !from || from.stack.length === 0) return;
-    from.stack.pop();
-    captor.points++;
-    hostBroadcastGame(); myGs = snapshot(); renderGame();
+async function hostProcessCapture(captorId, fromId) {
+    if (!currentLobbyCode) return;
+    await db.ref(`lobbies/${currentLobbyCode}/gameState`).transaction((state) => {
+        if (!state || !Array.isArray(state.players)) return state;
+        if (captorId === fromId) return state;
+
+        const captor = state.players.find((p) => p.id === captorId);
+        const from = state.players.find((p) => p.id === fromId);
+        if (!captor || !from) return state;
+
+        from.stack = from.stack || [];
+        if (from.stack.length === 0) return state;
+
+        from.stack.pop();
+        captor.points = (captor.points || 0) + 1;
+        return state;
+    });
 }
 
-// ================================================================
-//  GAME RENDERING
-// ================================================================
-function enterGame() { showScreen('game'); renderGame(); }
+function enterGame() {
+    showScreen('game');
+    renderGame();
+}
 
 function activeCard(player) {
     return player.stack.length ? player.stack[player.stack.length - 1] : null;
@@ -633,35 +813,39 @@ function activeCard(player) {
 function opponentPositions(count) {
     if (count === 0) return [];
     const tableH = window.innerHeight - 185;
-    const cx = 50, cy = (tableH / 2 / window.innerHeight) * 100;
-    const rx = 30, ry = 18, arc = count === 1 ? 0 : 130;
-    return Array.from({length:count}, (_, i) => {
-        const deg = count === 1 ? 270 : (270 - arc/2) + i*(arc/(count-1));
+    const cx = 50;
+    const cy = (tableH / 2 / window.innerHeight) * 100;
+    const rx = 30;
+    const ry = 18;
+    const arc = count === 1 ? 0 : 130;
+
+    return Array.from({ length: count }, (_, i) => {
+        const deg = count === 1 ? 270 : (270 - arc / 2) + i * (arc / (count - 1));
         const rad = deg * Math.PI / 180;
-        return { x: cx + rx*Math.cos(rad), y: cy + ry*Math.sin(rad) };
+        return { x: cx + rx * Math.cos(rad), y: cy + ry * Math.sin(rad) };
     });
 }
 
 function renderGame() {
-    const state = myGs || gs;
-    if (!state) return;
-    const myIdx = state.players.findIndex(p => p.id === myId);
+    const state = myGs;
+    if (!state || !Array.isArray(state.players) || !state.players.length) return;
+
+    const myIdx = state.players.findIndex((p) => p.id === myId);
     if (myIdx === -1) return;
 
-    const me        = state.players[myIdx];
+    const me = state.players[myIdx];
     const curPlayer = state.players[state.cpIdx];
-    const isMyTurn  = curPlayer.id === myId;
-    const canDraw   = isMyTurn && state.deck.length > 0;
+    const isMyTurn = curPlayer.id === myId;
+    const canDraw = isMyTurn && state.deck.length > 0;
 
-    // HUD
-    document.getElementById('hud-turn').textContent       = state.turn;
+    document.getElementById('hud-turn').textContent = state.turn || 1;
     document.getElementById('hud-whose-turn').textContent =
         isMyTurn ? 'Turno tuo' : 'Turno di ' + esc(curPlayer.name);
 
-    // Deck
     const rem = state.deck.length;
     document.getElementById('deck-count').textContent = rem + ' cart' + (rem !== 1 ? 'e' : 'a');
     const deckEl = document.getElementById('deck-icon');
+
     if (rem === 0) {
         deckEl.className = 'empty';
         document.getElementById('deck-hint').textContent = 'Mazzo esaurito';
@@ -673,91 +857,92 @@ function renderGame() {
         document.getElementById('deck-hint').textContent = 'Turno di ' + esc(curPlayer.name);
     }
 
-    // Self
     document.getElementById('self-name').textContent = esc(me.name) + ' (Tu)';
-    document.getElementById('self-pts').textContent  = me.points + ' pt';
+    document.getElementById('self-pts').textContent = (me.points || 0) + ' pt';
     document.getElementById('self-hint').textContent = isMyTurn
         ? (canDraw ? 'Pesca · o ruba una carta avversaria' : 'Ruba una carta avversaria')
         : 'Ruba una carta · ' + esc(curPlayer.name) + ' sta pescando';
+
     renderSelfHand(me);
 
-    // Opponents
-    document.querySelectorAll('.opp-zone').forEach(el => el.remove());
-    const n    = state.players.length;
-    const opps = Array.from({length: n-1}, (_, k) => state.players[(myIdx+k+1) % n]);
+    document.querySelectorAll('.opp-zone').forEach((el) => el.remove());
+    const n = state.players.length;
+    const opps = Array.from({ length: n - 1 }, (_, k) => state.players[(myIdx + k + 1) % n]);
     const positions = opponentPositions(opps.length);
 
     opps.forEach((opp, i) => {
-        const pos  = positions[i];
+        const pos = positions[i];
         const card = activeCard(opp);
         const capturable = card !== null;
 
-        const cardClass  = 'opp-card' + (capturable ? ' capturable' : '') + (!card ? ' empty-card' : '');
-        const symEmoji   = card ? (EMOJI[card.symbol] || card.symbol) : '—';
-        const inner      = card
+        const cardClass = 'opp-card' + (capturable ? ' capturable' : '') + (!card ? ' empty-card' : '');
+        const symEmoji = card ? (EMOJI[card.symbol] || card.symbol) : '—';
+        const inner = card
             ? `<div class="sym">${symEmoji}</div><div class="cat">${esc(card.category)}</div>`
             : `<div class="sym" style="color:#aaa;opacity:.3">—</div>`;
-        const handler    = capturable ? `onclick="onClickCapture('${opp.id}')"` : '';
+        const handler = capturable ? `onclick="onClickCapture('${opp.id}')"` : '';
 
         const zone = document.createElement('div');
-        zone.className  = 'opp-zone';
+        zone.className = 'opp-zone';
         zone.style.left = `${pos.x}vw`;
-        zone.style.top  = `${pos.y}vh`;
-        zone.innerHTML  = `
+        zone.style.top = `${pos.y}vh`;
+        zone.innerHTML = `
             <div class="opp-label">${esc(opp.name)}</div>
             <div class="${cardClass}" data-sym="${esc(symEmoji)}" ${handler}>${inner}</div>
-            <div class="opp-sub">${opp.stack.length} in pila &nbsp;·&nbsp; <span class="pts">${opp.points} pt</span></div>`;
+            <div class="opp-sub">${(opp.stack || []).length} in pila &nbsp;·&nbsp; <span class="pts">${opp.points || 0} pt</span></div>`;
         document.getElementById('game-table').appendChild(zone);
     });
 }
 
 function renderSelfHand(player) {
-    const hand  = document.getElementById('self-hand');
+    const hand = document.getElementById('self-hand');
     hand.innerHTML = '';
-    const stack = player.stack;
+    const stack = player.stack || [];
+
     if (!stack.length) {
         hand.innerHTML = '<div id="self-empty">Nessuna carta ancora</div>';
         return;
     }
-    const active    = stack[stack.length - 1];
+
+    const active = stack[stack.length - 1];
     const pileCount = stack.length - 1;
 
     const div = document.createElement('div');
-    div.className   = 'self-card top-card';
-    div.style.left  = '50%';
+    div.className = 'self-card top-card';
+    div.style.left = '50%';
     div.style.transform = 'translateX(-50%)';
-    div.innerHTML   = `<div class="sym">${EMOJI[active.symbol] || active.symbol}</div><div class="cat">${esc(active.category)}</div>`;
+    div.innerHTML = `<div class="sym">${EMOJI[active.symbol] || active.symbol}</div><div class="cat">${esc(active.category)}</div>`;
     hand.appendChild(div);
 
     if (pileCount > 0) {
         const badge = document.createElement('div');
-        badge.className   = 'pile-badge';
+        badge.className = 'pile-badge';
         badge.textContent = '+' + pileCount + ' sotto';
         hand.appendChild(badge);
     }
 }
 
-// ================================================================
-//  EVENT LISTENERS + INIT
-// ================================================================
 document.getElementById('deck-icon').addEventListener('click', onClickDeck);
 
 document.getElementById('join-code').addEventListener('input', function () {
-    this.value = this.value.toUpperCase().replace(/[^A-Z0-9]/g,'');
+    this.value = this.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
 });
 
-// Build category token picker
-(function () {
+(function buildCategoryPicker() {
     const picker = document.getElementById('create-category-list');
+    picker.innerHTML = '';
+
     Object.entries(CATEGORY_SETS).forEach(([key, set], idx) => {
         const tok = document.createElement('div');
-        tok.className   = 'cat-token' + (idx === 0 ? ' selected' : '');
+        tok.className = 'cat-token' + (idx === 0 ? ' selected' : '');
         tok.dataset.key = key;
         tok.textContent = set.label;
         tok.addEventListener('click', () => tok.classList.toggle('selected'));
         picker.appendChild(tok);
     });
 })();
+
+initFirebase();
 </script>
 </body>
 </html>
