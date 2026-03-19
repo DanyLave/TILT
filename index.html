@@ -469,6 +469,31 @@ function sortPlayers(playersObj, hostId) {
         });
 }
 
+function normalizeArray(value) {
+    if (Array.isArray(value)) return value.filter((v) => v !== null && v !== undefined);
+    if (value && typeof value === 'object') {
+        return Object.keys(value)
+            .sort((a, b) => Number(a) - Number(b))
+            .map((k) => value[k])
+            .filter((v) => v !== null && v !== undefined);
+    }
+    return [];
+}
+
+function normalizeGameState(gameState) {
+    if (!gameState || typeof gameState !== 'object') return null;
+    const players = normalizeArray(gameState.players).map((p) => ({
+        ...p,
+        stack: normalizeArray(p && p.stack)
+    }));
+    const deck = normalizeArray(gameState.deck);
+    return {
+        ...gameState,
+        players,
+        deck
+    };
+}
+
 function setupPresence() {
     if (!db || !currentLobbyCode) return;
     if (connectedRef) connectedRef.off();
@@ -525,7 +550,7 @@ function attachLobbyListener(code) {
         }
 
         if (data.status === 'playing' && data.gameState) {
-            myGs = data.gameState;
+            myGs = normalizeGameState(data.gameState);
             enterGame();
             return;
         }
@@ -770,13 +795,26 @@ function onClickCapture(fromPlayerId) {
 async function hostProcessDraw(actorId) {
     if (!currentLobbyCode) return;
     await db.ref(`lobbies/${currentLobbyCode}/gameState`).transaction((state) => {
-        if (!state || !Array.isArray(state.players) || !Array.isArray(state.deck)) return state;
-        const cp = state.players[state.cpIdx];
-        if (!cp || cp.id !== actorId || state.deck.length === 0) return state;
-        const card = state.deck.pop();
+        if (!state) return state;
+
+        const players = normalizeArray(state.players).map((p) => ({
+            ...p,
+            stack: normalizeArray(p && p.stack)
+        }));
+        const deck = normalizeArray(state.deck);
+        if (!players.length || !deck.length) return state;
+
+        const cpIdx = Number.isInteger(state.cpIdx) ? state.cpIdx : 0;
+        const cp = players[cpIdx];
+        if (!cp || cp.id !== actorId) return state;
+
+        const card = deck.pop();
         cp.stack = cp.stack || [];
         cp.stack.push(card);
-        state.cpIdx = (state.cpIdx + 1) % state.players.length;
+
+        state.players = players;
+        state.deck = deck;
+        state.cpIdx = (cpIdx + 1) % players.length;
         state.turn = (state.turn || 1) + 1;
         return state;
     });
@@ -785,11 +823,16 @@ async function hostProcessDraw(actorId) {
 async function hostProcessCapture(captorId, fromId) {
     if (!currentLobbyCode) return;
     await db.ref(`lobbies/${currentLobbyCode}/gameState`).transaction((state) => {
-        if (!state || !Array.isArray(state.players)) return state;
+        if (!state) return state;
         if (captorId === fromId) return state;
 
-        const captor = state.players.find((p) => p.id === captorId);
-        const from = state.players.find((p) => p.id === fromId);
+        const players = normalizeArray(state.players).map((p) => ({
+            ...p,
+            stack: normalizeArray(p && p.stack)
+        }));
+
+        const captor = players.find((p) => p.id === captorId);
+        const from = players.find((p) => p.id === fromId);
         if (!captor || !from) return state;
 
         from.stack = from.stack || [];
@@ -797,6 +840,7 @@ async function hostProcessCapture(captorId, fromId) {
 
         from.stack.pop();
         captor.points = (captor.points || 0) + 1;
+        state.players = players;
         return state;
     });
 }
@@ -807,7 +851,8 @@ function enterGame() {
 }
 
 function activeCard(player) {
-    return player.stack.length ? player.stack[player.stack.length - 1] : null;
+    const stack = normalizeArray(player && player.stack);
+    return stack.length ? stack[stack.length - 1] : null;
 }
 
 function opponentPositions(count) {
