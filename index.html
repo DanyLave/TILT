@@ -395,13 +395,13 @@
 <script src="categories.js"></script>
 <script>
 const DEFAULT_CATEGORY_KEY = Object.keys(CATEGORY_SETS)[0] || 'default';
-const PLAYER_ID_KEY = 'tiltPlayerId';
+const PLAYER_ID_KEY = 'tiltPlayerIdSession';
 
 const myId = (() => {
-    const existing = localStorage.getItem(PLAYER_ID_KEY);
+    const existing = sessionStorage.getItem(PLAYER_ID_KEY);
     if (existing) return existing;
     const generated = (Date.now().toString(36) + Math.random().toString(36).slice(2)).toUpperCase();
-    localStorage.setItem(PLAYER_ID_KEY, generated);
+    sessionStorage.setItem(PLAYER_ID_KEY, generated);
     return generated;
 })();
 
